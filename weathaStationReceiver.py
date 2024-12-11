@@ -2,7 +2,6 @@ import sys
 import json
 import os
 import psycopg2
-from collections import deque
 
 # Database connection details
 DB_NAME = os.getenv("POSTGRES_DB", "database")
@@ -11,8 +10,8 @@ DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 DB_HOST = "localhost"
 DB_PORT = 5432
 
-# Cache for last 10 packets
-cache = deque(maxlen=10)
+# Cache for the last packet
+cache = None
 
 def create_table_if_not_exists(conn):
     """Create the klimaData table if it does not exist."""
@@ -32,19 +31,26 @@ def create_table_if_not_exists(conn):
 
 def insert_data(conn, channel, sensor_id, temperature, humidity):
     """Insert data into the klimaData table."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO klimaData (time, channel, id, temperature, humidity)
-            VALUES (now(), %s, %s, %s, %s)
-            ON CONFLICT (time, channel) DO NOTHING;
-        """, (channel, sensor_id, temperature, humidity))
-        conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO klimaData (time, channel, id, temperature, humidity)
+                VALUES (now(), %s, %s, %s, %s)
+                ON CONFLICT (time, channel) DO NOTHING;
+            """, (channel, sensor_id, temperature, humidity))
+            conn.commit()
+    except psycopg2.Error as e:
+        print(f"Database error: {e}", file=sys.stderr)
+        conn.rollback()
 
 def is_duplicate(packet):
     """Check if the packet is a duplicate based on content."""
-    return packet in cache
+    global cache
+    return packet == cache
 
 def main():
+    global cache
+
     # Connect to the database
     try:
         conn = psycopg2.connect(
@@ -72,6 +78,11 @@ def main():
                 temperature = msg.get("temperature_C")
                 channel = msg.get("channel")
 
+                # Skip records with missing data
+                if channel is None or sensor_id is None or temperature is None or humidity is None:
+                    print("Skipping record with missing data", file=sys.stderr)
+                    continue
+
                 # Construct the packet content for comparison
                 packet = (channel, sensor_id, temperature, humidity)
 
@@ -79,8 +90,8 @@ def main():
                     print(f"Duplicate packet ignored: id: {sensor_id}, channel: {channel}, "
                           f"humidity: {humidity}%, temperature: {temperature}°C")
                 else:
-                    # Add the packet to the cache and insert into the database
-                    cache.append(packet)
+                    # Update the cache and insert into the database
+                    cache = packet
                     print(f"New packet: id: {sensor_id}, channel: {channel}, "
                           f"humidity: {humidity}%, temperature: {temperature}°C")
                     insert_data(conn, channel, sensor_id, temperature, humidity)
@@ -89,6 +100,7 @@ def main():
             print("Invalid JSON format", file=sys.stderr)
         except Exception as e:
             print(f"Error processing message: {e}", file=sys.stderr)
+            conn.rollback()
 
     # Close the database connection
     conn.close()
